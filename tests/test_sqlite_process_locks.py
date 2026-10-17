@@ -79,3 +79,45 @@ def test_permission_worker_failures_fail_closed(tmp_path, monkeypatch):
     monkeypatch.setattr(util.subprocess, "run", fail)
     with pytest.raises(OSError, match="permission worker"):
         util._restrict_existing_sqlite_artifacts(db)
+
+
+def test_permission_worker_uses_inode_pinned_path(monkeypatch):
+    # The isolated worker holds no SQLite locks, so it must not use the
+    # name-based chmod path that cannot pin the inode between stat and chmod.
+    monkeypatch.setattr(util, "_IN_PERMISSION_WORKER", True)
+    assert util._sqlite_artifact_supports_descriptor_free_chmod() is False
+
+
+@pytest.mark.parametrize("payload", [
+    '{"ok": false, "errno": "x", "reason": 5}',
+    '{"ok": false, "errno": -1}',
+    '{"ok": false}',
+])
+def test_permission_worker_malformed_refusal_fails_closed(tmp_path, monkeypatch, payload):
+    db = tmp_path / "probe.db"
+    db.touch()
+    monkeypatch.setattr(
+        util.subprocess, "run",
+        lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout=payload, stderr=""),
+    )
+    with pytest.raises(OSError) as info:
+        util._run_sqlite_permission_worker("restrict", db)
+    assert info.value.errno == util.errno.EPERM
+    assert isinstance(info.value.strerror, str) and info.value.strerror
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin isolation boundary")
+def test_real_worker_refuses_hardlinked_sidecar_without_touching_target(tmp_path):
+    db = tmp_path / "probe.db"
+    sqlite3.connect(db).close()
+    target = tmp_path / "unrelated.txt"
+    target.write_text("shared")
+    target.chmod(0o644)
+    os.link(target, tmp_path / "probe.db-wal")
+    with pytest.raises(OSError):
+        util._restrict_existing_sqlite_artifacts(db)
+    assert stat_mode(target) == 0o644
+
+
+def stat_mode(path):
+    return os.stat(path).st_mode & 0o777

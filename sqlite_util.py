@@ -66,8 +66,17 @@ def _open_private_sqlite_directory(path: Path) -> int:
     return directory_fd
 
 
+# Set only in the isolated Darwin permission worker (see ``__main__``). That
+# process holds no SQLite locks, so it must use the inode-pinned descriptor
+# path instead of the name-based ``chmod(..., follow_symlinks=False)`` path,
+# which cannot pin the inode between its stat and chmod.
+_IN_PERMISSION_WORKER = False
+
+
 def _sqlite_artifact_supports_descriptor_free_chmod() -> bool:
     """True when an existing artifact can be chmod'ed without opening it."""
+    if _IN_PERMISSION_WORKER:
+        return False
     return os.name == "posix" and os.chmod in os.supports_follow_symlinks
 
 
@@ -272,8 +281,10 @@ def _run_sqlite_permission_worker(operation: str, path: Path) -> None:
     except (subprocess.SubprocessError, ValueError) as exc:
         raise _sqlite_artifact_error(path, "permission worker failed") from exc
     if not payload["ok"]:
-        raise OSError(payload.get("errno") or errno.EPERM,
-                      payload.get("reason") or "permission worker refused artifact",
+        code = payload.get("errno")
+        reason = payload.get("reason")
+        raise OSError(code if type(code) is int and code > 0 else errno.EPERM,
+                      reason if isinstance(reason, str) and reason else "permission worker refused artifact",
                       str(path))
 
 
@@ -404,6 +415,7 @@ def _temporary_sqlite_busy_timeout(
 if __name__ == "__main__":
     if len(sys.argv) != 3 or sys.argv[1] not in ("prepare", "restrict"):
         raise SystemExit(2)
+    _IN_PERMISSION_WORKER = True
     try:
         operation = (_prepare_private_sqlite_file if sys.argv[1] == "prepare"
                      else _restrict_existing_sqlite_artifacts)
